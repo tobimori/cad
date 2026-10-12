@@ -21,6 +21,7 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { STLLoader } from "three/addons/loaders/STLLoader.js";
+import { toCreasedNormals } from "three/addons/utils/BufferGeometryUtils.js";
 import { createDialKit, createDialRoot } from "dialkit/vanilla";
 import "dialkit/vanilla/styles.css";
 
@@ -110,7 +111,8 @@ async function loadStl(file) {
   const geometry = new STLLoader().parse(await response.arrayBuffer());
   // OpenSCAD is Z-up, three.js is Y-up. The model front (-Y) now faces +Z
   geometry.rotateX(-Math.PI / 2);
-  return geometry;
+  // Smooth shading across facets of a curve, sharp shading at edges over 30°, the same angle as the edge lines
+  return toCreasedNormals(geometry, Math.PI / 6);
 }
 
 // The model on screen: { name, group, grid, stencil, items, edges, bounds }

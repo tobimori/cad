@@ -62,4 +62,8 @@ function cadReload() {
 
 export default defineConfig({
   plugins: [cadReload()],
+  // No SPA fallback, so a missing out/<name>.items.stl is a 404 and not index.html
+  appType: "mpa",
+  // Tailscale MagicDNS names, for pnpm dev --host <tailscale ip>
+  server: { allowedHosts: [".ts.net"] },
 });

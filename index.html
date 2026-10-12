@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CAD viewer</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #e8e5df; color: #2b2a28; font: 14px/1.4 system-ui, sans-serif; }
+  canvas { display: block; touch-action: none; }
+  #info { position: fixed; top: 12px; left: 12px; padding: 8px 12px; border-radius: 8px; background: rgb(255 255 255 / 55%); pointer-events: none; }
+  #info small { opacity: 0.6; }
+  #status { position: fixed; bottom: 12px; left: 12px; max-width: calc(100% - 48px); margin: 0; padding: 8px 12px; border-radius: 8px; background: rgb(255 255 255 / 70%); font: 12px/1.4 ui-monospace, monospace; white-space: pre-wrap; pointer-events: none; }
+  #status:empty { display: none; }
+  #status.failed { background: #f6d5cc; color: #8a2a12; }
+</style>
+</head>
+<body>
+<div id="info">Loading…</div>
+<pre id="status"></pre>
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { STLLoader } from "three/addons/loaders/STLLoader.js";
+import { createDialKit, createDialRoot } from "dialkit/vanilla";
+import "dialkit/vanilla/styles.css";
+
+// Shows out/<name>.stl. The URL hash selects the model, for example #aeropress_filters
+const GRID = 42;
+const info = document.getElementById("info");
+const hashName = () => decodeURIComponent(location.hash.slice(1));
+
+// make writes the model list. Without it, only the model in the hash is available
+const models = await fetch("out/models.json", { cache: "no-store" })
+  .then((response) => (response.ok ? response.json() : []))
+  .catch(() => []);
+if (hashName() && !models.includes(hashName())) models.push(hashName());
+if (!models.length) models.push("aeropress_filters");
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, stencil: true });
+renderer.setPixelRatio(devicePixelRatio);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFShadowMap;
+renderer.localClippingEnabled = true;
+document.body.append(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xe8e5df);
+scene.add(new THREE.HemisphereLight(0xffffff, 0xb5afa4, 1.3));
+
+const camera = new THREE.PerspectiveCamera(35, 1, 1, 5000);
+const headlight = new THREE.DirectionalLight(0xffffff, 0.7);
+headlight.position.set(0.6, 1, 0.4);
+camera.add(headlight);
+scene.add(camera);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+
+function resize() {
+  renderer.setSize(innerWidth, innerHeight);
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+}
+addEventListener("resize", resize);
+resize();
+
+// Fixed key light from the front left, with a soft shadow on the floor. Sized for each model in show()
+const sun = new THREE.DirectionalLight(0xffffff, 1.6);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.radius = 6;
+sun.shadow.bias = -0.0005;
+sun.shadow.normalBias = 0.3;
+scene.add(sun);
+const floor = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.ShadowMaterial({ opacity: 0.18 }));
+floor.rotation.x = -Math.PI / 2;
+floor.receiveShadow = true;
+scene.add(floor);
+
+// The section plane cuts all model materials
+const section = new THREE.Plane();
+const binMaterial = new THREE.MeshStandardMaterial({
+  polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1, clipShadows: true,
+});
+const itemMaterial = new THREE.MeshStandardMaterial({ roughness: 0.15, transparent: true, clipShadows: true });
+const edgeMaterial = new THREE.LineBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.12 });
+
+// Section cap, as in the three.js clipping stencil example. The cut bin back faces minus its front faces
+// mark the pixels where the cut goes through solid material, then the cap plane fills those pixels
+const stencilMaterial = (side, op) => new THREE.MeshBasicMaterial({
+  side, colorWrite: false, depthWrite: false, depthTest: false,
+  stencilWrite: true, stencilFunc: THREE.AlwaysStencilFunc, stencilFail: op, stencilZFail: op, stencilZPass: op,
+});
+const stencilBack = stencilMaterial(THREE.BackSide, THREE.IncrementWrapStencilOp);
+const stencilFront = stencilMaterial(THREE.FrontSide, THREE.DecrementWrapStencilOp);
+const cap = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({
+  side: THREE.DoubleSide, stencilWrite: true, stencilRef: 0, stencilFunc: THREE.NotEqualStencilFunc,
+  stencilFail: THREE.ReplaceStencilOp, stencilZFail: THREE.ReplaceStencilOp, stencilZPass: THREE.ReplaceStencilOp,
+}));
+cap.renderOrder = 2;
+cap.visible = false;
+cap.onAfterRender = (renderer) => renderer.clearStencil();
+scene.add(cap);
+const modelMaterials = [binMaterial, stencilBack, stencilFront, itemMaterial, edgeMaterial];
+
+// Returns null if the file does not exist
+async function loadStl(file) {
+  const response = await fetch(`out/${encodeURIComponent(file)}.stl`, { cache: "no-store" });
+  if (!response.ok) return null;
+  const geometry = new STLLoader().parse(await response.arrayBuffer());
+  // OpenSCAD is Z-up, three.js is Y-up. The model front (-Y) now faces +Z
+  geometry.rotateX(-Math.PI / 2);
+  return geometry;
+}
+
+// The model on screen: { name, group, grid, stencil, items, edges, bounds }
+let model = null;
+let request = 0;
+
+// frame moves the camera to the new model, a reload keeps the view
+async function show(name, frame) {
+  const token = ++request;
+  info.textContent = `Loading ${name}…`;
+  try {
+    const [geometry, itemGeometry] = await Promise.all([loadStl(name), loadStl(`${name}.items`)]);
+    if (token !== request) return;
+    if (!geometry) throw new Error(`out/${name}.stl not found, run make`);
+
+    geometry.computeBoundingBox();
+    const size = geometry.boundingBox.getSize(new THREE.Vector3());
+    const center = geometry.boundingBox.getCenter(new THREE.Vector3());
+    const offset = [-center.x, -geometry.boundingBox.min.y, -center.z];
+    geometry.translate(...offset);
+    // Optional out/<name>.items.stl with the items that go in the bin, in the same coordinates
+    itemGeometry?.translate(...offset);
+
+    const group = new THREE.Group();
+    const bin = new THREE.Mesh(geometry, binMaterial);
+    bin.castShadow = bin.receiveShadow = true;
+    const stencil = new THREE.Group();
+    stencil.add(new THREE.Mesh(geometry, stencilBack), new THREE.Mesh(geometry, stencilFront));
+    stencil.children.forEach((mesh) => (mesh.renderOrder = 1));
+    const edges = new THREE.LineSegments(new THREE.EdgesGeometry(geometry, 30), edgeMaterial);
+    const items = itemGeometry && new THREE.Mesh(itemGeometry, itemMaterial);
+    if (items) items.castShadow = true;
+    group.add(...[bin, stencil, edges, items].filter(Boolean));
+    const bounds = new THREE.Box3().setFromObject(group);
+
+    // Gridfinity grid, shifted half a cell on axes with an odd unit count so the cells line up
+    const unitsX = Math.round(size.x / GRID), unitsZ = Math.round(size.z / GRID);
+    const cells = 2 * Math.ceil(Math.max(unitsX, unitsZ) / 2) + 6;
+    const grid = new THREE.GridHelper(cells * GRID, cells, 0xc9c3b8, 0xd3cec5);
+    grid.position.set((unitsX % 2) * GRID / 2, -0.01, (unitsZ % 2) * GRID / 2);
+
+    if (model) {
+      scene.remove(model.group, model.grid);
+      model.group.traverse((object) => object.geometry?.dispose());
+      model.grid.geometry.dispose();
+    }
+    scene.add(group, grid);
+    model = { name, group, grid, stencil, items, edges, bounds };
+
+    const reach = bounds.getSize(new THREE.Vector3()).length();
+    sun.position.set(-0.6 * reach, 1.5 * reach, 0.7 * reach);
+    Object.assign(sun.shadow.camera, { left: -reach, right: reach, top: reach, bottom: -reach, far: 4 * reach });
+    sun.shadow.camera.updateProjectionMatrix();
+    floor.scale.setScalar(20 * reach);
+
+    apply(kit.values);
+    if (frame) view("iso", false);
+
+    const mm = (v) => v.toFixed(1);
+    document.title = `${name} · CAD viewer`;
+    info.innerHTML = `<b>${name}</b><br>${mm(size.x)} × ${mm(size.z)} × ${mm(size.y)} mm`
+      + ` · ${unitsX}×${unitsZ} grid<br><small>Drag to rotate · scroll to zoom · right-drag to pan</small>`;
+  } catch (error) {
+    if (token === request) info.textContent = `Cannot load model: ${error.message}`;
+  }
+}
+
+// Camera directions in three.js axes: +Z is the model front, +Y is up
+const VIEWS = {
+  iso: [0.9, 0.8, 1.4],
+  front: [0, 0, 1],
+  side: [1, 0, 0],
+  top: [0, 1, 0.001],
+};
+// The camera eases toward goal until the user takes over
+let goal = null;
+controls.addEventListener("start", () => (goal = null));
+
+function view(direction, animate = true) {
+  if (!model) return;
+  const target = model.bounds.getCenter(new THREE.Vector3());
+  const reach = model.bounds.getSize(new THREE.Vector3()).length();
+  // Fit the bounding sphere into the narrower field of view, so portrait screens show the full model
+  const halfFov = THREE.MathUtils.degToRad(camera.fov / 2);
+  const fitFov = Math.min(halfFov, Math.atan(Math.tan(halfFov) * camera.aspect));
+  const distance = 1.15 * (reach / 2) / Math.sin(fitFov);
+  const position = new THREE.Vector3(...VIEWS[direction]).setLength(distance).add(target);
+  goal = { target, position };
+  if (!animate) {
+    controls.target.copy(target);
+    camera.position.copy(position);
+    goal = null;
+  }
+}
+
+// The section normal points away from the part that stays, so the cut faces the default camera
+const SECTIONS = {
+  z: { axis: "y", normal: [0, -1, 0] },
+  y: { axis: "z", normal: [0, 0, -1] },
+  x: { axis: "x", normal: [-1, 0, 0] },
+};
+
+function apply(values) {
+  binMaterial.color.set(values.bin.color);
+  binMaterial.roughness = values.bin.roughness;
+  itemMaterial.color.set(values.items.color);
+  itemMaterial.opacity = values.items.opacity;
+  cap.material.color.set(values.section.color);
+  sun.castShadow = floor.visible = values.view.shadows;
+  controls.autoRotate = values.view.autoRotate;
+  if (!model) return;
+
+  model.edges.visible = values.bin.edges;
+  if (model.items) model.items.visible = values.items.visible;
+  model.grid.visible = values.view.grid;
+  const cut = SECTIONS[values.section.plane];
+  cap.visible = model.stencil.visible = Boolean(cut);
+  const planes = cut ? [section] : [];
+  for (const material of modelMaterials) material.clippingPlanes = planes;
+  if (cut) {
+    const { min, max } = model.bounds;
+    section.normal.set(...cut.normal);
+    section.constant = THREE.MathUtils.lerp(min[cut.axis], max[cut.axis], values.section.position);
+    // The cap lies in the section plane, centered on the model and large enough to cover it
+    section.projectPoint(model.bounds.getCenter(new THREE.Vector3()), cap.position);
+    cap.lookAt(cap.position.clone().sub(section.normal));
+    cap.scale.setScalar(2 * model.bounds.getSize(new THREE.Vector3()).length());
+  }
+}
+
+const label = (name) => name[0].toUpperCase() + name.slice(1).replaceAll("_", " ");
+const kit = createDialKit("Viewer", {
+  model: { type: "select", options: models.map((name) => ({ value: name, label: label(name) })) },
+  bin: {
+    // Matte cream, like a print in ivory PLA
+    color: "#f2ede3",
+    roughness: [0.85, 0, 1],
+    edges: true,
+  },
+  items: {
+    _collapsed: true,
+    visible: true,
+    // Brown glass, like the spice jars
+    color: "#7a3e12",
+    opacity: [0.6, 0, 1],
+  },
+  section: {
+    _collapsed: true,
+    plane: {
+      type: "select",
+      options: [
+        { value: "off", label: "Off" },
+        { value: "z", label: "Z, horizontal" },
+        { value: "y", label: "Y, front to back" },
+        { value: "x", label: "X, left to right" },
+      ],
+    },
+    position: [0.5, 0, 1, 0.01],
+    color: "#d9663f",
+  },
+  view: {
+    grid: true,
+    shadows: true,
+    autoRotate: false,
+    iso: { type: "action", label: "Iso view" },
+    front: { type: "action", label: "Front view" },
+    side: { type: "action", label: "Side view" },
+    top: { type: "action", label: "Top view" },
+    reload: { type: "action", label: "Reload model" },
+  },
+}, {
+  id: "cad-viewer",
+  persist: true,
+  onAction(path) {
+    const action = path.split(".").pop();
+    if (action === "reload") show(model?.name ?? kit.values.model, !model);
+    else view(action);
+  },
+});
+createDialRoot({ theme: "light", position: "top-right" });
+
+// The hash wins over the saved model, so links open the model they name
+const initial = models.includes(hashName()) ? hashName() : models.includes(kit.values.model) ? kit.values.model : models[0];
+if (kit.values.model !== initial) kit.setValue("model", initial);
+addEventListener("hashchange", () => {
+  if (models.includes(hashName())) kit.setValue("model", hashName());
+});
+let selected = null;
+kit.subscribe((values) => {
+  if (values.model !== selected) {
+    selected = values.model;
+    history.replaceState(null, "", `#${encodeURIComponent(selected)}`);
+    show(selected, true);
+  }
+  apply(values);
+});
+
+// pnpm dev runs make when a .scad file changes, see vite.config.js. The viewer reloads the STLs make writes
+if (import.meta.hot) {
+  const status = document.getElementById("status");
+  import.meta.hot.on("cad:make", ({ status: state, errors }) => {
+    status.className = state;
+    status.textContent = state === "running" ? "Running make…" : state === "failed" ? errors || "make failed" : "";
+  });
+  import.meta.hot.on("cad:out", async ({ file }) => {
+    if (file === "models.json") {
+      // make rewrites the list after each build, reload only when it has a new model
+      const list = await fetch("out/models.json", { cache: "no-store" }).then((response) => response.json());
+      if (list.some((name) => !models.includes(name))) location.reload();
+    } else if (model && (file === `${model.name}.stl` || file === `${model.name}.items.stl`)) {
+      show(model.name, false);
+    }
+  });
+}
+
+renderer.setAnimationLoop(() => {
+  if (goal) {
+    controls.target.lerp(goal.target, 0.15);
+    camera.position.lerp(goal.position, 0.15);
+    if (camera.position.distanceTo(goal.position) < 0.1) goal = null;
+  }
+  controls.update();
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>

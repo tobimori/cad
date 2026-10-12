@@ -33,7 +33,7 @@ rim_radius = 2.5; // .1
 // Fillet at the pocket bottom
 floor_radius = 2; // .1
 // Make the jars instead of the bin, to preview the fit
-show_jars = false;
+show_items = false;
 
 /* [Hidden] */
 $fa = 4;
@@ -100,7 +100,7 @@ module rim_roundover() {
     }
 }
 
-if (show_jars)
+if (show_items)
     // Molded glass has a rounded base edge
     each_jar() rounded_cylinder(jar_diameter / 2, jar_height, 3);
 else
